@@ -2,6 +2,10 @@ module.exports = function (RED) {
     "use strict";
     const node_lox_ws_api = require("node-lox-ws-api");
     const http = require('http');
+    //how long a webservice node waits for the answer of the miniserver
+    const WEBSERVICE_TIMEOUT = 10000;
+    //while the miniserver stays unreachable, repeat the warning only this often
+    const UNREACHABLE_WARN_INTERVAL = 10 * 60 * 1000;
     const encMethods = {
         0: 'Token-Enc',
         1: 'AES-256-CBC',
@@ -128,6 +132,7 @@ module.exports = function (RED) {
         node._webserviceNodeQueue = []; //only webservice nodes which are waiting for a return will be here
         node._otherEvents = [];
         node._lastOnlineState = null;
+        node.webserviceTimeout = WEBSERVICE_TIMEOUT;
 
         // TODO
         //do nothing if miniserver connection is not active
@@ -185,8 +190,15 @@ module.exports = function (RED) {
         });
 
         client.on('get_structure_file', function (data) {
-            node.log("got structure file " + data.lastModified);
-            node.structureData = prepareStructure(data);
+            //after a reconnect the library hands over the same object when nothing changed
+            if (!node.structureData || node._rawStructure !== data) {
+                node.log("got structure file " + data.lastModified);
+                node.structureData = prepareStructure(data);
+                node._rawStructure = data;
+            }
+            if (node._connectFailed) {
+                node.log('Miniserver reachable again after ' + node._failedAttempts + ' failed attempts');
+            }
             node._connectFailed = false;
             node.connected = true;
             node.setConnectionStatusMsg("green", "connected", "dot");
@@ -194,9 +206,26 @@ module.exports = function (RED) {
         });
 
         client.on('connect_failed', function (error, reason) {
-            node._connectFailed = true;
-            node.error('Miniserver connect failed: ' + reason);
+            let now = Date.now();
             node.setConnectionStatusMsg("red", "connection failed", "ring");
+
+            //only the first failure is an error, afterwards a warning every few minutes
+            if (!node._connectFailed) {
+                node._connectFailed = true;
+                node._failedSince = now;
+                node._failedAttempts = 1;
+                node._lastFailWarn = now;
+                node.error('Miniserver connect failed: ' + reason);
+                return;
+            }
+            node._failedAttempts++;
+            if (now - node._lastFailWarn >= UNREACHABLE_WARN_INTERVAL) {
+                node._lastFailWarn = now;
+                node.warn('Miniserver still unreachable since ' + new Date(node._failedSince).toISOString() +
+                    ' (' + node._failedAttempts + ' attempts): ' + reason);
+            } else {
+                node.debug('Miniserver connect failed: ' + reason);
+            }
         });
 
         client.on('connection_error', function (error, reason) {
@@ -222,6 +251,7 @@ module.exports = function (RED) {
 
             node.setConnectionStatusMsg("yellow", "connection closed", "ring");
             node.sendOnlineState(false);
+            node.failWebserviceRequests('connection closed');
         });
 
         client.on('send', function (message) {
@@ -369,11 +399,47 @@ module.exports = function (RED) {
     };
 
     LoxoneMiniserver.prototype.addWebserviceNodeToQueue = function (handler, msg, uri) {
-        this._webserviceNodeQueue.push({
+        let self = this;
+        let item = {
             'handler': handler,
             'msg': msg,
             'uri': uri
+        };
+        //without an answer the entry would stay in the queue forever
+        item.timer = setTimeout(function () {
+            self._failWebserviceRequest(item, 'timeout');
+        }, this.webserviceTimeout);
+        this._webserviceNodeQueue.push(item);
+    };
+
+    LoxoneMiniserver.prototype._failWebserviceRequest = function (item, reason) {
+        let idx = this._webserviceNodeQueue.indexOf(item);
+        if (idx === -1) {
+            return;
+        }
+        this._webserviceNodeQueue.splice(idx, 1);
+        clearTimeout(item.timer);
+        item.handler.status({
+            fill: 'red',
+            shape: 'dot',
+            text: reason
         });
+        item.handler.error('no answer for ' + item.uri + ' (' + reason + ')', item.msg);
+    };
+
+    LoxoneMiniserver.prototype.failWebserviceRequests = function (reason, handler) {
+        let pending = this._webserviceNodeQueue.filter(function (item) {
+            return !handler || item.handler === handler;
+        });
+        for (let i = 0; i < pending.length; i++) {
+            if (handler) {
+                //node is being closed, no error output anymore
+                clearTimeout(pending[i].timer);
+                removeFromList(this._webserviceNodeQueue, pending[i]);
+            } else {
+                this._failWebserviceRequest(pending[i], reason);
+            }
+        }
     };
 
     function removeFromList(list, handler) {
@@ -417,6 +483,7 @@ module.exports = function (RED) {
             return item.handler === handler && item.uri === uri;
         });
         if (idx !== -1) {
+            clearTimeout(this._webserviceNodeQueue[idx].timer);
             this._webserviceNodeQueue.splice(idx, 1);
         }
     };
@@ -679,6 +746,7 @@ module.exports = function (RED) {
             this.on('close', function (done) {
                 if (node.miniserver) {
                     node.miniserver.deregisterWebserviceNode(node);
+                    node.miniserver.failWebserviceRequests(null, node);
                 }
                 done();
             });

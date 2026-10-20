@@ -165,3 +165,80 @@ test('keepalive nodes do not crash before the structure file arrived', async () 
     assert.strictEqual(msgs[0].msInfo, null);
     await ms.close();
 });
+
+function webserviceFlow(ms) {
+    const [host, port] = ms.host.split(':');
+    return [
+        {id: 'ms', type: 'loxone-miniserver', host: host, port: port, enctype: 2, keepalive: 30000},
+        {id: 'ws', type: 'loxone-webservice', miniserver: 'ms', uri: 'jdev/sps/io/c1/state', appendpayload: false, wires: [['out']]},
+        {id: 'out', type: 'helper'},
+    ];
+}
+
+test('webservice requests are answered, time out or fail on disconnect', async () => {
+    const ms = await new MockMiniserver({structure}).listen();
+    await helper.load(loxoneNodes, webserviceFlow(ms), credentials);
+    const out = collect(helper.getNode('out'));
+    const wsNode = helper.getNode('ws');
+    const miniserver = helper.getNode('ms');
+    const errors = [];
+    wsNode.error = (text) => errors.push(text);
+    await waitFor(() => miniserver.connected);
+
+    wsNode.receive({payload: 1});
+    await waitFor(() => out.length === 1);
+    assert.strictEqual(out[0].topic, 'dev/sps/io/c1/state');
+    assert.strictEqual(miniserver._webserviceNodeQueue.length, 0);
+
+    miniserver.webserviceTimeout = 200;
+    wsNode.receive({payload: 1, uri: 'jdev/cfg/unknown'});
+    assert.strictEqual(miniserver._webserviceNodeQueue.length, 1);
+    await waitFor(() => errors.length === 1);
+    assert.match(errors[0], /timeout/);
+    assert.strictEqual(miniserver._webserviceNodeQueue.length, 0);
+
+    miniserver.webserviceTimeout = 60000;
+    wsNode.receive({payload: 1, uri: 'jdev/cfg/unknown'});
+    ms.dropAll();
+    await waitFor(() => errors.length === 2);
+    assert.match(errors[1], /connection closed/);
+    assert.strictEqual(miniserver._webserviceNodeQueue.length, 0);
+    await ms.close();
+});
+
+test('an unreachable miniserver logs one error, then only debug output', async () => {
+    const ms = await new MockMiniserver({structure}).listen();
+    const port = ms.port;
+    await ms.close();
+    await helper.load(loxoneNodes, flow({host: '127.0.0.1:' + port}), credentials);
+    const miniserver = helper.getNode('ms');
+    const logged = {error: 0, warn: 0, debug: 0};
+    ['error', 'warn', 'debug'].forEach((level) => {
+        miniserver[level] = () => logged[level]++;
+    });
+    await waitFor(() => miniserver._failedAttempts >= 3, 6000);
+    assert.strictEqual(logged.error, 1);
+    assert.strictEqual(logged.warn, 0);
+    assert.ok(logged.debug >= 2);
+});
+
+test('the structure is only prepared again when it changed', async () => {
+    const ms = await new MockMiniserver({structure}).listen();
+    await helper.load(loxoneNodes, flow(ms), credentials);
+    const miniserver = helper.getNode('ms');
+    await waitFor(() => miniserver.connected);
+    const first = miniserver.structureData;
+
+    ms.dropAll();
+    await waitFor(() => !miniserver.connected);
+    await waitFor(() => miniserver.connected, 5000);
+    assert.strictEqual(miniserver.structureData, first);
+
+    ms.options.structure = Object.assign({}, structure, {lastModified: '2026-03-03 00:00:00'});
+    ms.dropAll();
+    await waitFor(() => !miniserver.connected);
+    await waitFor(() => miniserver.connected, 5000);
+    assert.notStrictEqual(miniserver.structureData, first);
+    assert.strictEqual(miniserver.structureData.lastModified, '2026-03-03 00:00:00');
+    await ms.close();
+});

@@ -17,7 +17,7 @@
     "Dustin Utecht <dustin.utecht@codm.de> (https://www.codm.de/)"
   ],
   "dependencies": {
-    "node-lox-ws-api": "github:aikitori/node-lox-ws-api#0.5.0"
+    "node-lox-ws-api": "github:aikitori/node-lox-ws-api#0.5.1"
   },
   "repository": "codmpm/node-red-contrib-loxone",
   "engines": {
