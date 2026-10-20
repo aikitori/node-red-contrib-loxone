@@ -1,3 +1,14 @@
+### 0.11.0
+* node-lox-ws-api 0.5.0: uses [ws](https://github.com/websockets/ws) instead of WebSocket-Node, reconnects with a growing delay (1 s up to 30 s) instead of without any pause, fixes #73, #74, #92
+* fixed crash `ReferenceError: data is not defined` on unknown text messages, fixes #86
+* redeploy also stops a client that is still (re)connecting, before it kept running in the background, see #73, #57
+* `online` node only sends a message when the state changes, fixes #72
+* events are looked up in an index instead of searching all controls, much less CPU with many events, see #85 and #93 (thanks [Jakob-Gliwa](https://github.com/Jakob-Gliwa))
+* fixed deregistering of nodes, keepalive node no longer crashes before the structure file arrived
+* authentication errors are logged, status shows the next reconnect
+* requires Node.js 14 or newer
+* tests with a mocked Miniserver (`npm test`)
+
 ### 0.10.13
 *  Fixed Error when multiple messages over one node, thanks [Jakob-Gliwa](https://github.com/Jakob-Gliwa)
 

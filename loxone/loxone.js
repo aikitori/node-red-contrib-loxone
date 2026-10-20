@@ -81,11 +81,15 @@ module.exports = function (RED) {
                     data += chunk;
                 });
                 http_res.on('end', function () {
-                    result = {
-                        state: 'ok',
-                        msg: 'got miniserver structure',
-                        structure: prepareStructure(JSON.parse(data)),
-                    };
+                    try {
+                        result = {
+                            state: 'ok',
+                            msg: 'got miniserver structure',
+                            structure: prepareStructure(JSON.parse(data)),
+                        };
+                    } catch (e) {
+                        result.msg = 'invalid structure file';
+                    }
                     res.json(result);
                 });
             }
@@ -115,6 +119,7 @@ module.exports = function (RED) {
         node.structureData = null;
         node.active = true; //config.active;
         node._onlineNodes = [];
+        node._keepaliveNodes = [];
         node._inputNodes = [];
         node._outputNodes = [];
         node._streamInNodes = [];
@@ -122,6 +127,7 @@ module.exports = function (RED) {
         node._webserviceNodes = [];
         node._webserviceNodeQueue = []; //only webservice nodes which are waiting for a return will be here
         node._otherEvents = [];
+        node._lastOnlineState = null;
 
         // TODO
         //do nothing if miniserver connection is not active
@@ -153,8 +159,7 @@ module.exports = function (RED) {
             node.encMethod,
             config.keepalive
         );
-
-        client.connect();
+        node._client = client;
 
         client.on('connect', function () {
             node.log('Miniserver connected (' + config.host + ':' + config.port + ') using ' + node.encMethod);
@@ -165,21 +170,37 @@ module.exports = function (RED) {
             node.connection = client;
         });
 
+        client.on('auth_failed', function (message) {
+            node.error('Miniserver authentication failed: ' + (typeof message === 'string' ? message : JSON.stringify(message)));
+            node.setConnectionStatusMsg("red", "authentication failed", "ring");
+        });
+
+        client.on('reconnect', function (delay) {
+            let retry = ", retry in " + Math.round(delay / 1000) + "s";
+            if (node._connectFailed) {
+                node.setConnectionStatusMsg("red", "connection failed" + retry, "ring");
+            } else {
+                node.setConnectionStatusMsg("yellow", "connection closed" + retry, "ring");
+            }
+        });
+
         client.on('get_structure_file', function (data) {
             node.log("got structure file " + data.lastModified);
             node.structureData = prepareStructure(data);
+            node._connectFailed = false;
             node.connected = true;
             node.setConnectionStatusMsg("green", "connected", "dot");
-            sendOnlineNodeMsg(true, config.id);
+            node.sendOnlineState(true);
         });
 
         client.on('connect_failed', function (error, reason) {
-            node.error('Miniserver connect failed: ' + reason, JSON.stringify(error));
+            node._connectFailed = true;
+            node.error('Miniserver connect failed: ' + reason);
             node.setConnectionStatusMsg("red", "connection failed", "ring");
         });
 
         client.on('connection_error', function (error, reason) {
-            node.error('Miniserver connection error: ' + reason, JSON.stringify(error));
+            node.error('Miniserver connection error: ' + reason);
             node.setConnectionStatusMsg("red", "connection error", "ring");
         });
 
@@ -200,7 +221,7 @@ module.exports = function (RED) {
             }*/
 
             node.setConnectionStatusMsg("yellow", "connection closed", "ring");
-            sendOnlineNodeMsg(false, config.id);
+            node.sendOnlineState(false);
         });
 
         client.on('send', function (message) {
@@ -210,8 +231,7 @@ module.exports = function (RED) {
         client.on('message_text', function (message) {
             switch (message.type) {
                 case 'json':
-                    data.json = _limitString(JSON.stringify(message.json), text_logger_limit);
-                    node.log("received text message: " + data.json);
+                    node.log("received text message: " + _limitString(JSON.stringify(message.data), text_logger_limit));
 
                     break;
                 case 'control':
@@ -260,28 +280,19 @@ module.exports = function (RED) {
 
                     break;
                 default:
-                    data.text = _limitString(message.data, text_logger_limit);
-                    node.log("received text message: " + data.text);
+                    node.log("received text message: " + _limitString(String(message.data), text_logger_limit));
             }
         });
 
         client.on('keepalive', function (time) {
-            RED.nodes.eachNode(function (nodeData) {
-                if (nodeData.type === 'loxone-keepalive' &&
-                    nodeData.hasOwnProperty('miniserver') &&
-                    nodeData.miniserver === node.id) {
-
-                    let keepaliveNode = RED.nodes.getNode(nodeData.id);
-                    if (keepaliveNode) {
-                        keepaliveNode.send({
-                            topic: 'keepalive',
-                            payload: time,
-                            msInfo: node.structureData.msInfo,
-                            lastModified: node.structureData.lastModified
-                        });
-                    }
-                }
-            });
+            for (let i = 0; i < node._keepaliveNodes.length; i++) {
+                node._keepaliveNodes[i].send({
+                    topic: 'keepalive',
+                    payload: time,
+                    msInfo: node.structureData ? node.structureData.msInfo : null,
+                    lastModified: node.structureData ? node.structureData.lastModified : null
+                });
+            }
         });
 
         client.on('message_header', function (header) {
@@ -302,17 +313,22 @@ module.exports = function (RED) {
         client.on('update_event_daytimer', _updateEvent);
         client.on('update_event_weather', _updateEvent);
 
-        this.on('close', function (done) {
-            //on (full-)deploys close event shutdown the client
-            if (node.connected) {
-                client.once('close', function () {
-                    done();
-                });
-                client.abort();
-            } else {
-                done();
-            }
+        client.connect();
 
+        this.on('close', function (done) {
+            //on (full-)deploys shut the client down, also while it is (re)connecting,
+            //otherwise the old client keeps running next to the new one
+            let finished = false;
+            let finish = function () {
+                if (!finished) {
+                    finished = true;
+                    clearTimeout(timer);
+                    done();
+                }
+            };
+            let timer = setTimeout(finish, 5000);
+            client.once('abort', finish);
+            client.abort();
         });
     }
 
@@ -327,8 +343,13 @@ module.exports = function (RED) {
         this._onlineNodes.push(handler);
     };
 
+    LoxoneMiniserver.prototype.registerKeepaliveNode = function (handler) {
+        this._keepaliveNodes.push(handler);
+    };
+
     LoxoneMiniserver.prototype.registerInputNode = function (handler) {
         this._inputNodes.push(handler);
+        this._inputNodesByState = null;
     };
 
     LoxoneMiniserver.prototype.registerOutputNode = function (handler) {
@@ -355,60 +376,61 @@ module.exports = function (RED) {
         });
     };
 
+    function removeFromList(list, handler) {
+        const idx = list.indexOf(handler);
+        if (idx !== -1) {
+            list.splice(idx, 1);
+        }
+    }
+
     LoxoneMiniserver.prototype.deregisterOnlineNode = function (handler) {
-        this._onlineNodes.forEach(function (node, i, onlineNodes) {
-            if (node === handler) {
-                onlineNodes.splice(i, 1);
-            }
-        });
+        removeFromList(this._onlineNodes, handler);
+    };
+
+    LoxoneMiniserver.prototype.deregisterKeepaliveNode = function (handler) {
+        removeFromList(this._keepaliveNodes, handler);
     };
 
     LoxoneMiniserver.prototype.deregisterInputNode = function (handler) {
-        this._inputNodes.forEach(function (node, i, inputNodes) {
-            if (node === handler) {
-                inputNodes.splice(i, 1);
-            }
-        });
+        removeFromList(this._inputNodes, handler);
+        this._inputNodesByState = null;
     };
 
     LoxoneMiniserver.prototype.deregisterOutputNode = function (handler) {
-        this._outputNodes.forEach(function (node, i, outputNodes) {
-            if (node === handler) {
-                outputNodes.splice(i, 1);
-            }
-        });
+        removeFromList(this._outputNodes, handler);
     };
 
     LoxoneMiniserver.prototype.deregisterStreamInNode = function (handler) {
-        this._streamInNodes.forEach(function (node, i, streamInNodes) {
-            if (node === handler) {
-                streamInNodes.splice(i, 1);
-            }
-        });
+        removeFromList(this._streamInNodes, handler);
     };
 
     LoxoneMiniserver.prototype.deregisterStreamAllNode = function (handler) {
-        this._streamAllNodes.forEach(function (node, i, streamAllNodes) {
-            if (node === handler) {
-                streamAllNodes.splice(i, 1);
-            }
-        });
+        removeFromList(this._streamAllNodes, handler);
     };
 
     LoxoneMiniserver.prototype.deregisterWebserviceNode = function (handler) {
-        this._webserviceNodes.forEach(function (node, i, outputNodes) {
-            if (node === handler) {
-                outputNodes.splice(i, 1);
-            }
-        });
+        removeFromList(this._webserviceNodes, handler);
     };
 
     LoxoneMiniserver.prototype.removeWebserviceNodeFromQueue = function (handler, uri) {
-        this._webserviceNodeQueue.forEach(function (node, i, outputNodes) {
-            if (node.handler === handler && node.uri === uri) {
-                outputNodes.splice(i, 1);
-            }
+        const idx = this._webserviceNodeQueue.findIndex(function (item) {
+            return item.handler === handler && item.uri === uri;
         });
+        if (idx !== -1) {
+            this._webserviceNodeQueue.splice(idx, 1);
+        }
+    };
+
+    LoxoneMiniserver.prototype.sendOnlineState = function (online) {
+        if (this._lastOnlineState === online) {
+            return;
+        }
+        this._lastOnlineState = online;
+        for (let i = 0; i < this._onlineNodes.length; i++) {
+            this._onlineNodes[i].send({
+                payload: online
+            });
+        }
     };
 
     LoxoneMiniserver.prototype.setConnectionStatusMsg = function (color, text, shape) {
@@ -430,72 +452,30 @@ module.exports = function (RED) {
     };
 
     LoxoneMiniserver.prototype.findControlByState = function (uuid) {
-        //search in all controls for given state uuid to find the corresponding control
-        for (let wantedControlUuid in this.structureData.controls) {
-            if (
-                this.structureData.controls.hasOwnProperty(wantedControlUuid) &&
-                this.structureData.controls[wantedControlUuid].hasOwnProperty('states')
-            ) {
-                for (let curState in this.structureData.controls[wantedControlUuid].states) {
-
-                    if (
-                        this.structureData.controls[wantedControlUuid].states.hasOwnProperty(curState) &&
-                        (this.structureData.controls[wantedControlUuid].states[curState].indexOf(uuid) > -1 ||
-                            this.structureData.controls[wantedControlUuid].states[curState] === uuid)
-                    ) {
-                        return this.structureData.controls[wantedControlUuid];
-                    }
-                }
-            }
-        }
-
-        return null;
+        const entry = this.structureData ? this.structureData.stateIndex.get(uuid) : undefined;
+        return entry ? entry.control : null;
     };
 
-    LoxoneMiniserver.prototype.buildMsgObject = function (event, uuid, controlStructure) {
-        //get state name
-        let stateName;
-        for (stateName in controlStructure.states) {
-            if (
-                controlStructure.states.hasOwnProperty(stateName) &&
-                (controlStructure.states[stateName] === uuid || controlStructure.states[stateName].indexOf(uuid) > -1)
-            ) {
-
-                if (typeof controlStructure.states[stateName] !== 'string' && controlStructure.states[stateName].indexOf(uuid) > -1) {
-                    stateName += ':' + controlStructure.states[stateName].indexOf(uuid);
-                }
-
-                break;
-            }
+    function parsePayload(event) {
+        //value events are numbers, daytimer and weather events objects, only text events need parsing
+        if (typeof event !== 'string') {
+            return event;
         }
-
-        //evaluate payload
-        let payload;
-
         try {
-            payload = JSON.parse(event);
+            return JSON.parse(event);
         } catch (err) {
-            payload = event;
+            return event;
         }
+    }
 
-        //check if control has a room
-        let room = null;
-        if (controlStructure.room && this.structureData.rooms[controlStructure.room].name) {
-            room = this.structureData.rooms[controlStructure.room].name;
-        }
-
-        //check if control has a category
-        let category = null;
-        if (controlStructure.cat && this.structureData.cats[controlStructure.cat].name) {
-            category = this.structureData.cats[controlStructure.cat].name;
-        }
-
+    LoxoneMiniserver.prototype.buildMsgObject = function (event, uuid, entry) {
+        const controlStructure = entry.control;
         return {
-            payload: payload,
+            payload: parsePayload(event),
             topic: controlStructure.name || null,
-            state: stateName,
-            room: room,
-            category: category,
+            state: entry.stateName,
+            room: entry.room,
+            category: entry.category,
             details: controlStructure.details || null,
             type: controlStructure.type || null,
             isFavorite: controlStructure.isFavorite || null,
@@ -507,50 +487,66 @@ module.exports = function (RED) {
         };
     };
 
+    LoxoneMiniserver.prototype._getInputNodesByState = function () {
+        if (!this._inputNodesByState) {
+            const byState = new Map();
+            this._inputNodes.forEach(function (inputNode) {
+                if (!byState.has(inputNode.state)) {
+                    byState.set(inputNode.state, []);
+                }
+                byState.get(inputNode.state).push(inputNode);
+            });
+            this._inputNodesByState = byState;
+        }
+        return this._inputNodesByState;
+    };
+
     LoxoneMiniserver.prototype.handleEvent = function (uuid, event) {
         let i, curNode, curRoom, curCategory;
-        let controlStructure = this.findControlByState(uuid);
+        const entry = this.structureData ? this.structureData.stateIndex.get(uuid) : undefined;
 
         //do we have a control for this uuid? could also be weather or global
-        if (controlStructure) {
+        if (!entry) {
+            return;
+        }
+        const controlStructure = entry.control;
 
-            //publish event to control-in nodes
-            for (i = 0; i < this._inputNodes.length; i++) {
-                if (this._inputNodes[i].state === uuid) {
-                    this._inputNodes[i].send(this.buildMsgObject(event, uuid, controlStructure));
-                }
-            }
-
-            //publish event to stream-all node
-            for (i = 0; i < this._streamAllNodes.length; i++) {
-                curNode = this._streamAllNodes[i];
-                try {
-                    curNode.send(this.buildMsgObject(event, uuid, controlStructure));
-                } catch (error) {
-                    //TODO: error handling
-                }
-            }
-
-            //publish event to stream-in node
-            for (i = 0; i < this._streamInNodes.length; i++) {
-                curNode = this._streamInNodes[i];
-                curRoom = (curNode.hasOwnProperty('room')) ? curNode.room : null;
-                curCategory = (curNode.hasOwnProperty('category')) ? curNode.category : null;
-
-                //neither category or room present/filled, continue
-                if (!curRoom && !curCategory) {
-                    continue;
-                }
-
-                if (
-                    (!curRoom || curRoom === controlStructure.room) &&
-                    (!curCategory || curCategory === controlStructure.cat)
-                ) {
-                    curNode.send(this.buildMsgObject(event, uuid, controlStructure));
-                }
+        //publish event to control-in nodes
+        const inputNodes = this._getInputNodesByState().get(uuid);
+        if (inputNodes) {
+            for (i = 0; i < inputNodes.length; i++) {
+                inputNodes[i].send(this.buildMsgObject(event, uuid, entry));
             }
         }
 
+        //publish event to stream-all node
+        for (i = 0; i < this._streamAllNodes.length; i++) {
+            curNode = this._streamAllNodes[i];
+            try {
+                curNode.send(this.buildMsgObject(event, uuid, entry));
+            } catch (error) {
+                //TODO: error handling
+            }
+        }
+
+        //publish event to stream-in node
+        for (i = 0; i < this._streamInNodes.length; i++) {
+            curNode = this._streamInNodes[i];
+            curRoom = (curNode.hasOwnProperty('room')) ? curNode.room : null;
+            curCategory = (curNode.hasOwnProperty('category')) ? curNode.category : null;
+
+            //neither category or room present/filled, continue
+            if (!curRoom && !curCategory) {
+                continue;
+            }
+
+            if (
+                (!curRoom || curRoom === controlStructure.room) &&
+                (!curCategory || curCategory === controlStructure.cat)
+            ) {
+                curNode.send(this.buildMsgObject(event, uuid, entry));
+            }
+        }
     };
 
     function prepareStructure(data) {
@@ -582,33 +578,43 @@ module.exports = function (RED) {
             }
         }
 
-        return structure;
-    }
+        //index of all state uuids, built once per structure file instead of searching on every event
+        const stateIndex = new Map();
+        for (let controlUuid in structure.controls) {
+            if (!structure.controls.hasOwnProperty(controlUuid)) {
+                continue;
+            }
+            const control = structure.controls[controlUuid];
+            if (!control.states) {
+                continue;
+            }
+            const room = (control.room && structure.rooms[control.room] && structure.rooms[control.room].name) || null;
+            const category = (control.cat && structure.cats[control.cat] && structure.cats[control.cat].name) || null;
 
-    function sendOnlineNodeMsg(online, configId) {
-        online = online || false;
-
-        RED.nodes.eachNode(function (theNode) {
-            if (theNode.type === 'loxone-online' &&
-                theNode.hasOwnProperty('miniserver') &&
-                theNode.miniserver === configId) {
-
-                let node = RED.nodes.getNode(theNode.id);
-                if (node) {
-                    /*
-                    node.status({
-                        fill: (node.miniserver.active !== true) ? 'grey' : 'yellow',
-                        shape: 'dot',
-                        text: (node.miniserver.active !== true) ? 'connection disabled' : 'offline'
-                    });
-                    */
-
-                    node.send({
-                        payload: online
+            for (let stateName in control.states) {
+                if (!control.states.hasOwnProperty(stateName)) {
+                    continue;
+                }
+                const stateValue = control.states[stateName];
+                const uuids = Array.isArray(stateValue) ? stateValue : [stateValue];
+                for (let i = 0; i < uuids.length; i++) {
+                    //first match wins, like the former linear search
+                    if (typeof uuids[i] !== 'string' || stateIndex.has(uuids[i])) {
+                        continue;
+                    }
+                    stateIndex.set(uuids[i], {
+                        control: control,
+                        stateName: Array.isArray(stateValue) ? stateName + ':' + i : stateName,
+                        room: room,
+                        category: category
                     });
                 }
             }
-        });
+        }
+        //not enumerable, so the editor endpoint does not serialize it
+        Object.defineProperty(structure, 'stateIndex', {value: stateIndex});
+
+        return structure;
     }
 
     function LoxoneControlInNode(config) {
@@ -741,6 +747,19 @@ module.exports = function (RED) {
 
     function LoxoneKeepaliveNode(config) {
         RED.nodes.createNode(this, config);
+        let node = this;
+
+        node.miniserver = RED.nodes.getNode(config.miniserver);
+        if (node.miniserver) {
+            node.miniserver.registerKeepaliveNode(node);
+
+            this.on('close', function (done) {
+                if (node.miniserver) {
+                    node.miniserver.deregisterKeepaliveNode(node);
+                }
+                done();
+            });
+        }
     }
 
     RED.nodes.registerType('loxone-keepalive', LoxoneKeepaliveNode);
