@@ -1,3 +1,6 @@
+### 0.11.1
+* node-lox-ws-api 0.5.2: a connect attempt fails after 10 s without answer (Miniserver rebooting or unplugged), before it hung about 2 minutes and the status stayed at "retry in 1s"; the HTTP version check no longer keeps a second connection open for a few seconds
+
 ### 0.11.0
 * node-lox-ws-api 0.5.1: uses [ws](https://github.com/websockets/ws) instead of WebSocket-Node, reconnects with a growing delay (1 s up to 30 s) instead of without any pause, fixes #73, #74, #92
 * fixed crash `ReferenceError: data is not defined` on unknown text messages, fixes #86
