@@ -213,6 +213,7 @@ test('an unreachable miniserver logs one error, then only debug output', async (
     await ms.close();
     await helper.load(loxoneNodes, flow({host: '127.0.0.1:' + port}), credentials);
     const miniserver = helper.getNode('ms');
+    miniserver._client.reconnect_delay_min = 1000;
     const logged = {error: 0, warn: 0, debug: 0};
     ['error', 'warn', 'debug'].forEach((level) => {
         miniserver[level] = () => logged[level]++;

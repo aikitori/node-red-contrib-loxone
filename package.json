@@ -24,7 +24,7 @@
     "node": ">=14"
   },
   "scripts": {
-    "test": "node --test test/"
+    "test": "node --test test/*.test.js"
   },
   "devDependencies": {
     "node-red": "^4.0.0",
