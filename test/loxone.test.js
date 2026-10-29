@@ -103,6 +103,7 @@ test('a dropped connection sends offline once and reconnects', async () => {
     const online = collect(helper.getNode('out_online'));
     const miniserver = helper.getNode('ms');
     await waitFor(() => miniserver.connected);
+    miniserver._client.reconnect_delay_min = 1000;
 
     ms.dropAll();
     await waitFor(() => !miniserver.connected);
@@ -227,6 +228,7 @@ test('the structure is only prepared again when it changed', async () => {
     await helper.load(loxoneNodes, flow(ms), credentials);
     const miniserver = helper.getNode('ms');
     await waitFor(() => miniserver.connected);
+    miniserver._client.reconnect_delay_min = 1000;
     const first = miniserver.structureData;
 
     ms.dropAll();
